@@ -41,6 +41,8 @@ type CLI struct {
 	InsecureIgnoreHostKey bool     `help:"Disable SSH host key verification and do not read known_hosts."`
 	FallbackToDefault     bool     `help:"When enabled, retry deps.dev lookup with the package default version if the requested version is not found."`
 	Format                string   `help:"Output format." enum:"table,csv" default:"table"`
+	Parallelism           int      `help:"Maximum number of targets processed concurrently." default:"4"`
+	LookupParallelism     int      `help:"Maximum number of concurrent deps.dev lookups." default:"20"`
 	Targets               []string `arg:"" name:"target" help:"Scan target directories or git repository URLs."`
 }
 
@@ -105,7 +107,18 @@ type statusLine struct {
 	current string
 }
 
+type progressTracker struct {
+	mu               sync.Mutex
+	stage            string
+	totalTargets     int
+	completedTargets int
+	manifestCount    int
+	totalLookups     int
+	completedLookups int
+}
+
 var progress = newStatusLine(os.Stderr)
+var tracker = &progressTracker{}
 
 func newStatusLine(file *os.File) *statusLine {
 	return &statusLine{
@@ -154,6 +167,86 @@ func (s *statusLine) Warnf(format string, args ...any) {
 	}
 }
 
+func (t *progressTracker) StartTargetStage(total int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.stage = "targets"
+	t.totalTargets = total
+	t.completedTargets = 0
+	t.manifestCount = 0
+	t.renderLocked()
+}
+
+func (t *progressTracker) TargetManifestFound() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.stage != "targets" {
+		return
+	}
+
+	t.manifestCount++
+	if t.manifestCount == 1 || t.manifestCount%10 == 0 {
+		t.renderLocked()
+	}
+}
+
+func (t *progressTracker) TargetCompleted() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.stage != "targets" {
+		return
+	}
+
+	t.completedTargets++
+	t.renderLocked()
+}
+
+func (t *progressTracker) StartLicenseStage(total int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.stage = "licenses"
+	t.totalLookups = total
+	t.completedLookups = 0
+	t.renderLocked()
+}
+
+func (t *progressTracker) LicenseCompleted() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.stage != "licenses" {
+		return
+	}
+
+	t.completedLookups++
+	if t.completedLookups == 1 || t.completedLookups == t.totalLookups || t.completedLookups%10 == 0 {
+		t.renderLocked()
+	}
+}
+
+func (t *progressTracker) SetRenderingStage() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.stage = "rendering"
+	t.renderLocked()
+}
+
+func (t *progressTracker) renderLocked() {
+	switch t.stage {
+	case "targets":
+		progress.Update(fmt.Sprintf("Processing targets... %d/%d completed, %d manifests found", t.completedTargets, t.totalTargets, t.manifestCount))
+	case "licenses":
+		progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", t.completedLookups, t.totalLookups))
+	case "rendering":
+		progress.Update("Rendering output...")
+	}
+}
+
 func main() {
 	var cli CLI
 	kong.Parse(&cli,
@@ -164,32 +257,61 @@ func main() {
 	if len(cli.Targets) == 0 {
 		exitIfErr(fmt.Errorf("at least one target is required"))
 	}
+	if cli.Parallelism < 1 {
+		exitIfErr(fmt.Errorf("--parallelism must be at least 1"))
+	}
+	if cli.LookupParallelism < 1 {
+		exitIfErr(fmt.Errorf("--lookup-parallelism must be at least 1"))
+	}
 
-	var bundles []scanBundle
+	tracker.StartTargetStage(len(cli.Targets))
+
+	bundleSlots := make([]*scanBundle, len(cli.Targets))
+	var bundleMu sync.Mutex
+	var g errgroup.Group
+	g.SetLimit(cli.Parallelism)
+
 	for i, target := range cli.Targets {
-		sourceName := displaySourceName(target)
-		progress.Update(fmt.Sprintf("Scanning target %d/%d: %s", i+1, len(cli.Targets), sourceName))
-		results, err := scanTarget(target, cli.InsecureIgnoreHostKey)
-		if err != nil {
-			var cloneErr *cloneFailureError
-			if errors.As(err, &cloneErr) {
-				progress.Warnf("warning: %v", err)
-				continue
-			}
-			exitIfErr(err)
-		}
+		i := i
+		target := target
+		g.Go(func() error {
+			defer tracker.TargetCompleted()
 
-		bundles = append(bundles, scanBundle{
-			SourceName: sourceName,
-			Results:    results,
+			sourceName := displaySourceName(target)
+			results, err := scanTarget(target, cli.InsecureIgnoreHostKey)
+			if err != nil {
+				var cloneErr *cloneFailureError
+				if errors.As(err, &cloneErr) {
+					progress.Warnf("warning: %v", err)
+					return nil
+				}
+				return err
+			}
+
+			bundleMu.Lock()
+			bundleSlots[i] = &scanBundle{
+				SourceName: sourceName,
+				Results:    results,
+			}
+			bundleMu.Unlock()
+			return nil
 		})
 	}
 
-	progress.Update("Resolving licenses...")
-	exitIfErr(enrichLicenses(bundles, cli.FallbackToDefault))
+	exitIfErr(g.Wait())
+
+	bundles := make([]scanBundle, 0, len(bundleSlots))
+	for _, bundle := range bundleSlots {
+		if bundle == nil {
+			continue
+		}
+		bundles = append(bundles, *bundle)
+	}
+
+	exitIfErr(enrichLicenses(bundles, cli.FallbackToDefault, cli.LookupParallelism))
 
 	rows := buildOutputRows(bundles)
-	progress.Update("Rendering output...")
+	tracker.SetRenderingStage()
 	progress.Clear()
 	exitIfErr(renderOutput(os.Stdout, cli.Format, rows))
 	progress.Clear()
@@ -223,7 +345,6 @@ func scanTarget(target string, insecureIgnoreHostKey bool) ([]manifestResult, er
 }
 
 func cloneRepository(repo string, insecureIgnoreHostKey bool) (billy.Filesystem, error) {
-	progress.Update(fmt.Sprintf("Cloning repository: %s", displaySourceName(repo)))
 	auth, err := authForRepository(repo, insecureIgnoreHostKey)
 	if err != nil {
 		return nil, err
@@ -243,7 +364,6 @@ func cloneRepository(repo string, insecureIgnoreHostKey bool) (billy.Filesystem,
 
 func scanLocalFilesystem(root string) ([]manifestResult, error) {
 	var results []manifestResult
-	found := 0
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -268,10 +388,7 @@ func scanLocalFilesystem(root string) ([]manifestResult, error) {
 			return err
 		}
 
-		found++
-		if found == 1 || found%10 == 0 {
-			progress.Update(fmt.Sprintf("Scanning manifests... %d found", found))
-		}
+		tracker.TargetManifestFound()
 
 		return nil
 	})
@@ -279,13 +396,11 @@ func scanLocalFilesystem(root string) ([]manifestResult, error) {
 		return nil, err
 	}
 
-	progress.Update(fmt.Sprintf("Scanning manifests... %d found", found))
 	return results, nil
 }
 
 func scanBillyFilesystem(fs billy.Filesystem, root string) ([]manifestResult, error) {
 	var results []manifestResult
-	found := 0
 
 	err := billyutil.Walk(fs, root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -310,10 +425,7 @@ func scanBillyFilesystem(fs billy.Filesystem, root string) ([]manifestResult, er
 			return err
 		}
 
-		found++
-		if found == 1 || found%10 == 0 {
-			progress.Update(fmt.Sprintf("Scanning manifests... %d found", found))
-		}
+		tracker.TargetManifestFound()
 
 		return nil
 	})
@@ -321,7 +433,6 @@ func scanBillyFilesystem(fs billy.Filesystem, root string) ([]manifestResult, er
 		return nil, err
 	}
 
-	progress.Update(fmt.Sprintf("Scanning manifests... %d found", found))
 	return results, nil
 }
 
@@ -452,7 +563,7 @@ func sortDependencies(dependencies []dependency) {
 	})
 }
 
-func enrichLicenses(bundles []scanBundle, fallbackToDefault bool) error {
+func enrichLicenses(bundles []scanBundle, fallbackToDefault bool, lookupParallelism int) error {
 	keys := make(map[dependencyVersionKey]struct{})
 
 	for i := range bundles {
@@ -493,7 +604,7 @@ func enrichLicenses(bundles []scanBundle, fallbackToDefault bool) error {
 	}
 	defer conn.Close()
 
-	licenses, err := fetchLicenses(client, keys, fallbackToDefault)
+	licenses, err := fetchLicenses(client, keys, fallbackToDefault, lookupParallelism)
 	if err != nil {
 		return err
 	}
@@ -649,17 +760,15 @@ func newDepsDevClient() (pb.InsightsClient, *grpc.ClientConn, error) {
 	return pb.NewInsightsClient(conn), conn, nil
 }
 
-func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struct{}, fallbackToDefault bool) (map[dependencyVersionKey]licenseLookupResult, error) {
+func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struct{}, fallbackToDefault bool, lookupParallelism int) (map[dependencyVersionKey]licenseLookupResult, error) {
 	ctx := context.Background()
 	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(20)
+	g.SetLimit(lookupParallelism)
 
 	limiter := rate.NewLimiter(50, 1)
 	licenses := make(map[dependencyVersionKey]licenseLookupResult, len(keys))
 	var mu sync.Mutex
-	total := len(keys)
-	completed := 0
-	progress.Update(fmt.Sprintf("Resolving licenses... 0/%d", total))
+	tracker.StartLicenseStage(len(keys))
 
 	for key := range keys {
 		key := key
@@ -670,11 +779,8 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 					License:        "lookup-error",
 					QueriedVersion: key.Version,
 				}
-				completed++
-				if completed == 1 || completed == total || completed%10 == 0 {
-					progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-				}
 				mu.Unlock()
+				tracker.LicenseCompleted()
 				progress.Warnf("warning: deps.dev rate limiter failed for %s@%s: %v", key.Name, key.Version, err)
 				return nil
 			}
@@ -688,21 +794,15 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 						License:        "lookup-error",
 						QueriedVersion: key.Version,
 					}
-					completed++
-					if completed == 1 || completed == total || completed%10 == 0 {
-						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-					}
 					mu.Unlock()
+					tracker.LicenseCompleted()
 					progress.Warnf("warning: deps.dev fallback lookup failed for %s: %v", key.Name, fallbackErr)
 					return nil
 				case resolved:
 					mu.Lock()
 					licenses[key] = license
-					completed++
-					if completed == 1 || completed == total || completed%10 == 0 {
-						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-					}
 					mu.Unlock()
+					tracker.LicenseCompleted()
 					return nil
 				default:
 					mu.Lock()
@@ -710,11 +810,8 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 						License:        "not-found",
 						QueriedVersion: key.Version,
 					}
-					completed++
-					if completed == 1 || completed == total || completed%10 == 0 {
-						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-					}
 					mu.Unlock()
+					tracker.LicenseCompleted()
 					return nil
 				}
 			}
@@ -738,21 +835,15 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 								License:        "lookup-error",
 								QueriedVersion: key.Version,
 							}
-							completed++
-							if completed == 1 || completed == total || completed%10 == 0 {
-								progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-							}
 							mu.Unlock()
+							tracker.LicenseCompleted()
 							progress.Warnf("warning: deps.dev fallback lookup failed for %s@%s: %v", key.Name, key.Version, fallbackErr)
 							return nil
 						case resolved:
 							mu.Lock()
 							licenses[key] = license
-							completed++
-							if completed == 1 || completed == total || completed%10 == 0 {
-								progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-							}
 							mu.Unlock()
+							tracker.LicenseCompleted()
 							return nil
 						}
 					}
@@ -762,11 +853,8 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 						License:        "not-found",
 						QueriedVersion: key.Version,
 					}
-					completed++
-					if completed == 1 || completed == total || completed%10 == 0 {
-						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-					}
 					mu.Unlock()
+					tracker.LicenseCompleted()
 					return nil
 				default:
 					mu.Lock()
@@ -774,11 +862,8 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 						License:        "lookup-error",
 						QueriedVersion: key.Version,
 					}
-					completed++
-					if completed == 1 || completed == total || completed%10 == 0 {
-						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-					}
 					mu.Unlock()
+					tracker.LicenseCompleted()
 					progress.Warnf("warning: deps.dev lookup failed for %s@%s: %v", key.Name, key.Version, err)
 					return nil
 				}
@@ -789,11 +874,8 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 				License:        formatLicenses(resp),
 				QueriedVersion: key.Version,
 			}
-			completed++
-			if completed == 1 || completed == total || completed%10 == 0 {
-				progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
-			}
 			mu.Unlock()
+			tracker.LicenseCompleted()
 			return nil
 		})
 	}

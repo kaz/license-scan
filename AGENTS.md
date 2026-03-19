@@ -7,6 +7,8 @@ This file is a handoff note for future LLM agents working on `license-scan`.
 `license-scan` is a Go CLI that:
 
 - scans one or more local directories and/or Git repositories
+- processes targets concurrently with bounded parallelism
+- resolves deps.dev lookups with separately configurable bounded parallelism
 - finds `package.json` and `go.mod`
 - extracts direct dependency declarations
 - resolves licenses via `deps.dev` gRPC API v3
@@ -19,6 +21,8 @@ Main implementation lives in `main.go`.
 Current flags:
 
 - `--format table|csv`
+- `--parallelism`
+- `--lookup-parallelism`
 - `--insecure-ignore-host-key`
 - `--fallback-to-default`
 
@@ -171,10 +175,10 @@ Behavior:
 - writes progress to `stderr`
 - rewrites one line in TTY mode
 - warnings are printed as normal lines
+- progress is intentionally aggregate-only so it stays readable with concurrent target processing
 - progress currently includes:
-  - scanning target
-  - cloning repository
-  - scanning manifests count
+  - completed target count
+  - discovered manifest count
   - resolving licenses count
   - rendering output
 
@@ -189,10 +193,12 @@ These are intentional and should not be “cleaned up” without checking the ex
 3. SSH auth is default for SSH URLs; there is no `--use-ssh-agent` flag anymore.
 4. `deps.dev/api/v3alpha` was replaced by `deps.dev/api/v3`.
 5. `grpc.Dial` was replaced by `grpc.NewClient`.
-6. deps.dev lookup failures no longer abort the whole run.
-7. Git clone failures no longer abort the whole run.
-8. `version` output column was added to show the actually queried version.
-9. Fallback marker changed from `(*)` to ` *`.
+6. Target scanning is parallelized with bounded concurrency, but final output order still follows input order.
+7. Target parallelism and deps.dev lookup parallelism are configurable independently.
+8. deps.dev lookup failures no longer abort the whole run.
+9. Git clone failures no longer abort the whole run.
+10. `version` output column was added to show the actually queried version.
+11. Fallback marker changed from `(*)` to ` *`.
 
 ## Files Worth Checking Before Changes
 

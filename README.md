@@ -8,6 +8,7 @@ It is designed for quick license inventory generation across mixed Go and Node.j
 
 - Scan one or more local directories
 - Scan one or more remote Git repositories
+- Process multiple targets concurrently
 - Clone Git repositories in memory without creating temporary working directories
 - Detect:
   - `package.json`
@@ -83,7 +84,7 @@ license-scan <target> [<target>...]
 ## Usage
 
 ```bash
-license-scan [--format table|csv] [--fallback-to-default] [--insecure-ignore-host-key] <target> [<target>...]
+license-scan [--format table|csv] [--parallelism N] [--lookup-parallelism N] [--fallback-to-default] [--insecure-ignore-host-key] <target> [<target>...]
 ```
 
 ### Flags
@@ -92,6 +93,14 @@ license-scan [--format table|csv] [--fallback-to-default] [--insecure-ignore-hos
   - Output format.
   - Supported values: `table`, `csv`
   - Default: `table`
+
+- `--parallelism`
+  - Maximum number of targets processed concurrently.
+  - Default: `4`
+
+- `--lookup-parallelism`
+  - Maximum number of concurrent deps.dev license lookups.
+  - Default: `20`
 
 - `--insecure-ignore-host-key`
   - Disables SSH host key verification for SSH Git repository access.
@@ -306,13 +315,15 @@ While the tool is running, it writes status updates to `stderr`.
 
 Typical messages include:
 
-- scanning targets
-- cloning repositories
-- counting discovered manifest files
+- processing targets
+- completed target count
+- discovered manifest count
 - resolving licenses
 - rendering output
 
 When `stderr` is attached to a terminal, the status line is updated in place instead of printing a new line every time.
+
+The progress display is intentionally aggregate-only so it remains readable while multiple targets are processed concurrently.
 
 Warnings are printed as normal lines so they remain visible.
 
