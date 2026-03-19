@@ -83,7 +83,7 @@ license-scan <target> [<target>...]
 ## Usage
 
 ```bash
-license-scan [--format table|csv] [--insecure-ignore-host-key] <target> [<target>...]
+license-scan [--format table|csv] [--fallback-to-default] [--insecure-ignore-host-key] <target> [<target>...]
 ```
 
 ### Flags
@@ -98,6 +98,10 @@ license-scan [--format table|csv] [--insecure-ignore-host-key] <target> [<target
   - This also prevents reading `known_hosts`.
   - Only valid for SSH repository URLs.
   - This reduces security and should only be used when you understand the risk.
+
+- `--fallback-to-default`
+  - If the requested package version is not found in deps.dev, retry using the package default version.
+  - This fallback is also used when the tool cannot normalize a dependency specification into a single version.
 
 ## Examples
 
@@ -149,16 +153,17 @@ Columns:
 - `manifest`
 - `dependency_type`
 - `library`
+- `version`
 - `license`
 
 Example:
 
 ```text
-┌──────────────────────────┬──────────────────────┬─────────────────┬──────────────────────────────┬──────────────┐
-│ SOURCE                   │ MANIFEST             │ DEPENDENCY TYPE │ LIBRARY                      │ LICENSE      │
-├──────────────────────────┼──────────────────────┼─────────────────┼──────────────────────────────┼──────────────┤
-│ github.com/golang/example│ ragserver/go.mod     │ require         │ google.golang.org/api        │ BSD-3-Clause │
-└──────────────────────────┴──────────────────────┴─────────────────┴──────────────────────────────┴──────────────┘
+┌──────────────────────────┬──────────────────────┬─────────────────┬──────────────────────────────┬───────────┬──────────────┐
+│ SOURCE                   │ MANIFEST             │ DEPENDENCY TYPE │ LIBRARY                      │ VERSION   │ LICENSE      │
+├──────────────────────────┼──────────────────────┼─────────────────┼──────────────────────────────┼───────────┼──────────────┤
+│ github.com/golang/example│ ragserver/go.mod     │ require         │ google.golang.org/api        │ v0.194.0  │ BSD-3-Clause │
+└──────────────────────────┴──────────────────────┴─────────────────┴──────────────────────────────┴───────────┴──────────────┘
 ```
 
 ## CSV Output
@@ -168,14 +173,14 @@ CSV includes the same information and is easier to consume from scripts or sprea
 Header:
 
 ```csv
-source,manifest,dependency_type,library,license
+source,manifest,dependency_type,library,version,license
 ```
 
 Example:
 
 ```csv
-source,manifest,dependency_type,library,license
-github.com/golang/example,go.mod,require,golang.org/x/tools,BSD-3-Clause
+source,manifest,dependency_type,library,version,license
+github.com/golang/example,go.mod,require,golang.org/x/tools,v0.33.0,BSD-3-Clause
 ```
 
 ## Column Definitions
@@ -196,6 +201,10 @@ github.com/golang/example,go.mod,require,golang.org/x/tools,BSD-3-Clause
 
 - `library`
   - Package or module name.
+
+- `version`
+  - The version actually queried against deps.dev.
+  - If fallback-to-default was used, the version is suffixed with ` *`.
 
 - `license`
   - License value returned or derived from deps.dev.
@@ -231,6 +240,23 @@ Examples:
 - `github:user/repo`
 - URL-based dependencies
 - wildcard versions such as `*`, `x`, or `X`
+
+### Optional fallback to the default package version
+
+When `--fallback-to-default` is enabled, the tool keeps its normal version-specific lookup behavior first whenever a concrete version is available.
+
+It falls back to the package default version when either of the following is true:
+
+1. deps.dev cannot find the requested version
+2. the tool cannot normalize the dependency specification to a single concrete version
+
+In those cases it will:
+
+1. query package metadata with `GetPackage`
+2. locate the package default version
+3. query that default version with `GetVersion`
+
+If that fallback succeeds, the returned license is used in the output.
 
 ## Special License Values
 

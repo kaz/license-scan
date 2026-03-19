@@ -39,16 +39,19 @@ import (
 
 type CLI struct {
 	InsecureIgnoreHostKey bool     `help:"Disable SSH host key verification and do not read known_hosts."`
+	FallbackToDefault     bool     `help:"When enabled, retry deps.dev lookup with the package default version if the requested version is not found."`
 	Format                string   `help:"Output format." enum:"table,csv" default:"table"`
 	Targets               []string `arg:"" name:"target" help:"Scan target directories or git repository URLs."`
 }
 
 type dependency struct {
-	Scope   string
-	Name    string
-	Version string
-	System  pb.System
-	License string
+	Scope          string
+	Name           string
+	Version        string
+	System         pb.System
+	License        string
+	QueriedVersion string
+	FallbackUsed   bool
 }
 
 type manifestResult struct {
@@ -67,7 +70,14 @@ type outputRow struct {
 	ManifestPath string
 	Dependency   string
 	LibraryName  string
+	Version      string
 	License      string
+}
+
+type licenseLookupResult struct {
+	License        string
+	QueriedVersion string
+	FallbackUsed   bool
 }
 
 type scanBundle struct {
@@ -176,7 +186,7 @@ func main() {
 	}
 
 	progress.Update("Resolving licenses...")
-	exitIfErr(enrichLicenses(bundles))
+	exitIfErr(enrichLicenses(bundles, cli.FallbackToDefault))
 
 	rows := buildOutputRows(bundles)
 	progress.Update("Rendering output...")
@@ -442,7 +452,7 @@ func sortDependencies(dependencies []dependency) {
 	})
 }
 
-func enrichLicenses(bundles []scanBundle) error {
+func enrichLicenses(bundles []scanBundle, fallbackToDefault bool) error {
 	keys := make(map[dependencyVersionKey]struct{})
 
 	for i := range bundles {
@@ -451,6 +461,14 @@ func enrichLicenses(bundles []scanBundle) error {
 				dep := &bundles[i].Results[j].Dependencies[k]
 				version, ok := depsDevLookupVersion(*dep)
 				if !ok {
+					if fallbackToDefault {
+						keys[dependencyVersionKey{
+							System: dep.System,
+							Name:   dep.Name,
+						}] = struct{}{}
+						continue
+					}
+
 					dep.License = "unresolved-version"
 					continue
 				}
@@ -475,7 +493,7 @@ func enrichLicenses(bundles []scanBundle) error {
 	}
 	defer conn.Close()
 
-	licenses, err := fetchLicenses(client, keys)
+	licenses, err := fetchLicenses(client, keys, fallbackToDefault)
 	if err != nil {
 		return err
 	}
@@ -493,14 +511,22 @@ func enrichLicenses(bundles []scanBundle) error {
 					Name:    dep.Name,
 					Version: resolvedVersionForLicenseLookup(*dep),
 				}
+				if key.Version == "" && fallbackToDefault {
+					key = dependencyVersionKey{
+						System: dep.System,
+						Name:   dep.Name,
+					}
+				}
 
-				license, ok := licenses[key]
-				if !ok || license == "" {
+				lookup, ok := licenses[key]
+				if !ok || lookup.License == "" {
 					dep.License = "unknown"
 					continue
 				}
 
-				dep.License = license
+				dep.License = lookup.License
+				dep.QueriedVersion = lookup.QueriedVersion
+				dep.FallbackUsed = lookup.FallbackUsed
 			}
 		}
 	}
@@ -623,23 +649,27 @@ func newDepsDevClient() (pb.InsightsClient, *grpc.ClientConn, error) {
 	return pb.NewInsightsClient(conn), conn, nil
 }
 
-func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struct{}) (map[dependencyVersionKey]string, error) {
+func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struct{}, fallbackToDefault bool) (map[dependencyVersionKey]licenseLookupResult, error) {
 	ctx := context.Background()
 	g, _ := errgroup.WithContext(ctx)
 	g.SetLimit(20)
 
 	limiter := rate.NewLimiter(50, 1)
-	licenses := make(map[dependencyVersionKey]string, len(keys))
+	licenses := make(map[dependencyVersionKey]licenseLookupResult, len(keys))
 	var mu sync.Mutex
 	total := len(keys)
 	completed := 0
 	progress.Update(fmt.Sprintf("Resolving licenses... 0/%d", total))
 
 	for key := range keys {
+		key := key
 		g.Go(func() error {
 			if err := limiter.Wait(ctx); err != nil {
 				mu.Lock()
-				licenses[key] = "lookup-error"
+				licenses[key] = licenseLookupResult{
+					License:        "lookup-error",
+					QueriedVersion: key.Version,
+				}
 				completed++
 				if completed == 1 || completed == total || completed%10 == 0 {
 					progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
@@ -647,6 +677,46 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 				mu.Unlock()
 				progress.Warnf("warning: deps.dev rate limiter failed for %s@%s: %v", key.Name, key.Version, err)
 				return nil
+			}
+
+			if key.Version == "" {
+				license, resolved, fallbackErr := lookupDefaultVersionLicense(ctx, client, key)
+				switch {
+				case fallbackErr != nil:
+					mu.Lock()
+					licenses[key] = licenseLookupResult{
+						License:        "lookup-error",
+						QueriedVersion: key.Version,
+					}
+					completed++
+					if completed == 1 || completed == total || completed%10 == 0 {
+						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
+					}
+					mu.Unlock()
+					progress.Warnf("warning: deps.dev fallback lookup failed for %s: %v", key.Name, fallbackErr)
+					return nil
+				case resolved:
+					mu.Lock()
+					licenses[key] = license
+					completed++
+					if completed == 1 || completed == total || completed%10 == 0 {
+						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
+					}
+					mu.Unlock()
+					return nil
+				default:
+					mu.Lock()
+					licenses[key] = licenseLookupResult{
+						License:        "not-found",
+						QueriedVersion: key.Version,
+					}
+					completed++
+					if completed == 1 || completed == total || completed%10 == 0 {
+						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
+					}
+					mu.Unlock()
+					return nil
+				}
 			}
 
 			resp, err := client.GetVersion(ctx, &pb.GetVersionRequest{
@@ -659,8 +729,39 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 			if err != nil {
 				switch status.Code(err) {
 				case codes.NotFound:
+					if fallbackToDefault {
+						license, resolved, fallbackErr := lookupDefaultVersionLicense(ctx, client, key)
+						switch {
+						case fallbackErr != nil:
+							mu.Lock()
+							licenses[key] = licenseLookupResult{
+								License:        "lookup-error",
+								QueriedVersion: key.Version,
+							}
+							completed++
+							if completed == 1 || completed == total || completed%10 == 0 {
+								progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
+							}
+							mu.Unlock()
+							progress.Warnf("warning: deps.dev fallback lookup failed for %s@%s: %v", key.Name, key.Version, fallbackErr)
+							return nil
+						case resolved:
+							mu.Lock()
+							licenses[key] = license
+							completed++
+							if completed == 1 || completed == total || completed%10 == 0 {
+								progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
+							}
+							mu.Unlock()
+							return nil
+						}
+					}
+
 					mu.Lock()
-					licenses[key] = "not-found"
+					licenses[key] = licenseLookupResult{
+						License:        "not-found",
+						QueriedVersion: key.Version,
+					}
 					completed++
 					if completed == 1 || completed == total || completed%10 == 0 {
 						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
@@ -669,7 +770,10 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 					return nil
 				default:
 					mu.Lock()
-					licenses[key] = "lookup-error"
+					licenses[key] = licenseLookupResult{
+						License:        "lookup-error",
+						QueriedVersion: key.Version,
+					}
 					completed++
 					if completed == 1 || completed == total || completed%10 == 0 {
 						progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
@@ -681,7 +785,10 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 			}
 
 			mu.Lock()
-			licenses[key] = formatLicenses(resp)
+			licenses[key] = licenseLookupResult{
+				License:        formatLicenses(resp),
+				QueriedVersion: key.Version,
+			}
 			completed++
 			if completed == 1 || completed == total || completed%10 == 0 {
 				progress.Update(fmt.Sprintf("Resolving licenses... %d/%d", completed, total))
@@ -696,6 +803,62 @@ func fetchLicenses(client pb.InsightsClient, keys map[dependencyVersionKey]struc
 	}
 
 	return licenses, nil
+}
+
+func lookupDefaultVersionLicense(ctx context.Context, client pb.InsightsClient, key dependencyVersionKey) (licenseLookupResult, bool, error) {
+	pkg, err := client.GetPackage(ctx, &pb.GetPackageRequest{
+		PackageKey: &pb.PackageKey{
+			System: key.System,
+			Name:   key.Name,
+		},
+	})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return licenseLookupResult{}, false, nil
+		}
+		return licenseLookupResult{}, false, err
+	}
+
+	defaultVersion := defaultPackageVersion(pkg)
+	if defaultVersion == "" {
+		return licenseLookupResult{}, false, nil
+	}
+
+	resp, err := client.GetVersion(ctx, &pb.GetVersionRequest{
+		VersionKey: &pb.VersionKey{
+			System:  key.System,
+			Name:    key.Name,
+			Version: defaultVersion,
+		},
+	})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return licenseLookupResult{}, false, nil
+		}
+		return licenseLookupResult{}, false, err
+	}
+
+	return licenseLookupResult{
+		License:        formatLicenses(resp),
+		QueriedVersion: defaultVersion,
+		FallbackUsed:   true,
+	}, true, nil
+}
+
+func defaultPackageVersion(pkg *pb.Package) string {
+	if pkg == nil {
+		return ""
+	}
+
+	for _, version := range pkg.GetVersions() {
+		if version != nil && version.GetIsDefault() {
+			if key := version.GetVersionKey(); key != nil {
+				return key.GetVersion()
+			}
+		}
+	}
+
+	return ""
 }
 
 func formatLicenses(version *pb.Version) string {
@@ -733,6 +896,18 @@ func joinUniqueSorted(values []string) string {
 	return strings.Join(sorted, ",")
 }
 
+func displayQueriedVersion(dep dependency) string {
+	if dep.QueriedVersion == "" {
+		return ""
+	}
+
+	if dep.FallbackUsed {
+		return dep.QueriedVersion + " *"
+	}
+
+	return dep.QueriedVersion
+}
+
 func buildOutputRows(bundles []scanBundle) []outputRow {
 	rows := make([]outputRow, 0)
 	for _, bundle := range bundles {
@@ -743,6 +918,7 @@ func buildOutputRows(bundles []scanBundle) []outputRow {
 					ManifestPath: result.Path,
 					Dependency:   dep.Scope,
 					LibraryName:  dep.Name,
+					Version:      displayQueriedVersion(dep),
 					License:      dep.License,
 				})
 			}
@@ -770,6 +946,7 @@ func renderCSV(w io.Writer, rows []outputRow) error {
 		"manifest",
 		"dependency_type",
 		"library",
+		"version",
 		"license",
 	}); err != nil {
 		return err
@@ -781,6 +958,7 @@ func renderCSV(w io.Writer, rows []outputRow) error {
 			row.ManifestPath,
 			row.Dependency,
 			row.LibraryName,
+			row.Version,
 			row.License,
 		}); err != nil {
 			return err
@@ -798,6 +976,7 @@ func renderTable(w io.Writer, rows []outputRow) error {
 		"manifest",
 		"dependency_type",
 		"library",
+		"version",
 		"license",
 	})
 
@@ -807,6 +986,7 @@ func renderTable(w io.Writer, rows []outputRow) error {
 			row.ManifestPath,
 			row.Dependency,
 			row.LibraryName,
+			row.Version,
 			row.License,
 		})
 	}
