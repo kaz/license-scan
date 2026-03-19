@@ -38,12 +38,12 @@ import (
 )
 
 type CLI struct {
-	InsecureIgnoreHostKey bool     `help:"Disable SSH host key verification and do not read known_hosts."`
-	FallbackToDefault     bool     `help:"When enabled, retry deps.dev lookup with the package default version if the requested version is not found."`
-	Format                string   `help:"Output format." enum:"table,csv" default:"table"`
-	Parallelism           int      `help:"Maximum number of targets processed concurrently." default:"4"`
-	LookupParallelism     int      `help:"Maximum number of concurrent deps.dev lookups." default:"20"`
-	Targets               []string `arg:"" name:"target" help:"Scan target directories or git repository URLs."`
+	IgnoreHostKey     bool     `help:"Disable SSH host key verification and do not read known_hosts." default:"true"`
+	FallbackToDefault bool     `help:"When enabled, retry deps.dev lookup with the package default version if the requested version is not found." default:"true"`
+	Format            string   `help:"Output format." enum:"table,csv" default:"table"`
+	TargetJobs        int      `help:"Maximum number of targets processed concurrently." default:"8"`
+	DepsJobs          int      `help:"Maximum number of concurrent deps.dev lookups." default:"32"`
+	Targets           []string `arg:"" name:"target" help:"Scan target directories or git repository URLs."`
 }
 
 type dependency struct {
@@ -257,11 +257,11 @@ func main() {
 	if len(cli.Targets) == 0 {
 		exitIfErr(fmt.Errorf("at least one target is required"))
 	}
-	if cli.Parallelism < 1 {
-		exitIfErr(fmt.Errorf("--parallelism must be at least 1"))
+	if cli.TargetJobs < 1 {
+		exitIfErr(fmt.Errorf("--target-jobs must be at least 1"))
 	}
-	if cli.LookupParallelism < 1 {
-		exitIfErr(fmt.Errorf("--lookup-parallelism must be at least 1"))
+	if cli.DepsJobs < 1 {
+		exitIfErr(fmt.Errorf("--deps-jobs must be at least 1"))
 	}
 
 	tracker.StartTargetStage(len(cli.Targets))
@@ -269,7 +269,7 @@ func main() {
 	bundleSlots := make([]*scanBundle, len(cli.Targets))
 	var bundleMu sync.Mutex
 	var g errgroup.Group
-	g.SetLimit(cli.Parallelism)
+	g.SetLimit(cli.TargetJobs)
 
 	for i, target := range cli.Targets {
 		i := i
@@ -278,7 +278,7 @@ func main() {
 			defer tracker.TargetCompleted()
 
 			sourceName := displaySourceName(target)
-			results, err := scanTarget(target, cli.InsecureIgnoreHostKey)
+			results, err := scanTarget(target, cli.IgnoreHostKey)
 			if err != nil {
 				var cloneErr *cloneFailureError
 				if errors.As(err, &cloneErr) {
@@ -308,7 +308,7 @@ func main() {
 		bundles = append(bundles, *bundle)
 	}
 
-	exitIfErr(enrichLicenses(bundles, cli.FallbackToDefault, cli.LookupParallelism))
+	exitIfErr(enrichLicenses(bundles, cli.FallbackToDefault, cli.DepsJobs))
 
 	rows := buildOutputRows(bundles)
 	tracker.SetRenderingStage()
@@ -317,9 +317,9 @@ func main() {
 	progress.Clear()
 }
 
-func scanTarget(target string, insecureIgnoreHostKey bool) ([]manifestResult, error) {
+func scanTarget(target string, ignoreHostKey bool) ([]manifestResult, error) {
 	if isGitRepository(target) {
-		repoFS, err := cloneRepository(target, insecureIgnoreHostKey)
+		repoFS, err := cloneRepository(target, ignoreHostKey)
 		if err != nil {
 			return nil, err
 		}
@@ -344,8 +344,8 @@ func scanTarget(target string, insecureIgnoreHostKey bool) ([]manifestResult, er
 	return scanLocalFilesystem(root)
 }
 
-func cloneRepository(repo string, insecureIgnoreHostKey bool) (billy.Filesystem, error) {
-	auth, err := authForRepository(repo, insecureIgnoreHostKey)
+func cloneRepository(repo string, ignoreHostKey bool) (billy.Filesystem, error) {
+	auth, err := authForRepository(repo, ignoreHostKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1156,10 +1156,10 @@ func isSCPLikeGitURL(target string) bool {
 		!strings.Contains(target, "://")
 }
 
-func authForRepository(repo string, insecureIgnoreHostKey bool) (transport.AuthMethod, error) {
+func authForRepository(repo string, ignoreHostKey bool) (transport.AuthMethod, error) {
 	if !isSSHRepository(repo) {
-		if insecureIgnoreHostKey {
-			return nil, fmt.Errorf("--insecure-ignore-host-key requires an SSH repository URL")
+		if ignoreHostKey {
+			return nil, fmt.Errorf("--ignore-host-key requires an SSH repository URL")
 		}
 		return nil, nil
 	}
@@ -1169,7 +1169,7 @@ func authForRepository(repo string, insecureIgnoreHostKey bool) (transport.AuthM
 		return nil, fmt.Errorf("ssh-agent auth setup failed: %w", err)
 	}
 
-	if insecureIgnoreHostKey {
+	if ignoreHostKey {
 		auth.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 		auth.HostKeyAlgorithms = nil
 	}

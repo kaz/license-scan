@@ -84,7 +84,7 @@ license-scan <target> [<target>...]
 ## Usage
 
 ```bash
-license-scan [--format table|csv] [--parallelism N] [--lookup-parallelism N] [--fallback-to-default] [--insecure-ignore-host-key] <target> [<target>...]
+license-scan [--format table|csv] [--target-jobs N] [--deps-jobs N] [--fallback-to-default=false] [--ignore-host-key=false] <target> [<target>...]
 ```
 
 ### Flags
@@ -94,23 +94,27 @@ license-scan [--format table|csv] [--parallelism N] [--lookup-parallelism N] [--
   - Supported values: `table`, `csv`
   - Default: `table`
 
-- `--parallelism`
+- `--target-jobs`
   - Maximum number of targets processed concurrently.
-  - Default: `4`
+  - Default: `8`
 
-- `--lookup-parallelism`
+- `--deps-jobs`
   - Maximum number of concurrent deps.dev license lookups.
-  - Default: `20`
+  - Default: `32`
 
-- `--insecure-ignore-host-key`
+- `--ignore-host-key`
   - Disables SSH host key verification for SSH Git repository access.
   - This also prevents reading `known_hosts`.
   - Only valid for SSH repository URLs.
   - This reduces security and should only be used when you understand the risk.
+  - Default: `true`
+  - Disable with: `--ignore-host-key=false`
 
 - `--fallback-to-default`
   - If the requested package version is not found in deps.dev, retry using the package default version.
   - This fallback is also used when the tool cannot normalize a dependency specification into a single version.
+  - Default: `true`
+  - Disable with: `--fallback-to-default=false`
 
 ## Examples
 
@@ -144,10 +148,22 @@ license-scan . ./frontend https://github.com/golang/example.git
 license-scan --format csv . > out.csv
 ```
 
-### Use SSH and skip host key verification
+### Use SSH scanning with default host key skipping
 
 ```bash
-license-scan --insecure-ignore-host-key git@github.com:owner/repo.git
+license-scan git@github.com:owner/repo.git
+```
+
+### Re-enable SSH host key verification
+
+```bash
+license-scan --ignore-host-key=false git@github.com:owner/repo.git
+```
+
+### Disable deps.dev default-version fallback
+
+```bash
+license-scan --fallback-to-default=false .
 ```
 
 ## Output Formats
@@ -252,7 +268,7 @@ Examples:
 
 ### Optional fallback to the default package version
 
-When `--fallback-to-default` is enabled, the tool keeps its normal version-specific lookup behavior first whenever a concrete version is available.
+By default, the tool keeps its normal version-specific lookup behavior first whenever a concrete version is available, and falls back to the package default version when needed.
 
 It falls back to the package default version when either of the following is true:
 
@@ -305,9 +321,10 @@ The tool exits with an error if:
 
 - a target path does not exist
 - a local target is not a directory
-- a Git repository cannot be cloned
 - the deps.dev client cannot be initialized
 - invalid flag combinations are used
+
+Git clone failures are reported as warnings and the tool continues with remaining targets.
 
 ## Progress Output
 
@@ -345,7 +362,7 @@ For SSH Git URLs, the tool uses `ssh-agent` by default.
 
 ### Host key verification
 
-By default, SSH host keys are verified using normal SSH behavior. If you pass `--insecure-ignore-host-key`, host key verification is disabled.
+By default, SSH host key verification is disabled and `known_hosts` is not read. If you want normal SSH host key verification, pass `--ignore-host-key=false`.
 
 ## Notes and Limitations
 

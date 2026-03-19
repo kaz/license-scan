@@ -21,9 +21,9 @@ Main implementation lives in `main.go`.
 Current flags:
 
 - `--format table|csv`
-- `--parallelism`
-- `--lookup-parallelism`
-- `--insecure-ignore-host-key`
+- `--target-jobs`
+- `--deps-jobs`
+- `--ignore-host-key`
 - `--fallback-to-default`
 
 Positional arguments:
@@ -34,7 +34,8 @@ Positional arguments:
 SSH behavior:
 
 - SSH Git URLs use `ssh-agent` by default
-- `--insecure-ignore-host-key` disables host key verification for SSH URLs only
+- `--ignore-host-key` defaults to enabled and disables host key verification for SSH URLs only
+- `--ignore-host-key=false` re-enables normal SSH host key verification
 
 ## Current Dependency Extraction Rules
 
@@ -73,7 +74,7 @@ deps.dev client:
 Lookup flow:
 
 1. Try version-specific lookup first if a concrete version is available.
-2. If `--fallback-to-default` is enabled:
+2. `--fallback-to-default` is enabled by default:
    - fallback when requested version is `NotFound`
    - fallback when dependency spec cannot be normalized into a single version
 3. Fallback logic:
@@ -103,11 +104,11 @@ Current unresolved cases include:
 - raw URLs
 - wildcard specs such as `*`, `x`, `X`
 
-If unresolved and `--fallback-to-default` is off:
+If unresolved and `--fallback-to-default=false`:
 
 - output license becomes `unresolved-version`
 
-If unresolved and `--fallback-to-default` is on:
+If unresolved and `--fallback-to-default` is on (the default):
 
 - tool still tries package default version
 
