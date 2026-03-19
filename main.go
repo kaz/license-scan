@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -72,6 +73,19 @@ type outputRow struct {
 type scanBundle struct {
 	SourceName string
 	Results    []manifestResult
+}
+
+type cloneFailureError struct {
+	repo string
+	err  error
+}
+
+func (e *cloneFailureError) Error() string {
+	return fmt.Sprintf("repository clone failed for %s: %v", e.repo, e.err)
+}
+
+func (e *cloneFailureError) Unwrap() error {
+	return e.err
 }
 
 type statusLine struct {
@@ -146,7 +160,14 @@ func main() {
 		sourceName := displaySourceName(target)
 		progress.Update(fmt.Sprintf("Scanning target %d/%d: %s", i+1, len(cli.Targets), sourceName))
 		results, err := scanTarget(target, cli.InsecureIgnoreHostKey)
-		exitIfErr(err)
+		if err != nil {
+			var cloneErr *cloneFailureError
+			if errors.As(err, &cloneErr) {
+				progress.Warnf("warning: %v", err)
+				continue
+			}
+			exitIfErr(err)
+		}
 
 		bundles = append(bundles, scanBundle{
 			SourceName: sourceName,
@@ -204,7 +225,7 @@ func cloneRepository(repo string, insecureIgnoreHostKey bool) (billy.Filesystem,
 		Depth: 1,
 		Auth:  auth,
 	}); err != nil {
-		return nil, fmt.Errorf("repository clone failed: %w", err)
+		return nil, &cloneFailureError{repo: displaySourceName(repo), err: err}
 	}
 
 	return repoFS, nil
